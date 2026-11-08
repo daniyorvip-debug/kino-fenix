@@ -10,6 +10,11 @@
 #   ADMIN_IDS
 #
 # Majburiy obuna tekshiruvi ishlashi uchun bot kanallarda admin bo‘lishi kerak.
+#
+# Yopiq (so‘rov bilan qo‘shiladigan) kanallar uchun:
+#   - bot kanalda admin bo‘lishi va "Foydalanuvchilarni taklif qilish" huquqiga ega bo‘lishi kerak;
+#   - kanal /Kanallar bo‘limida username emas, raqamli ID (-100...) bilan qo‘shiladi;
+#   - foydalanuvchi qo‘shilish so‘rovini yuborgach, bot uni "obuna bo‘lgan" deb hisoblaydi.
 
 import html
 import logging
@@ -223,6 +228,17 @@ def init_db():
             code TEXT NOT NULL,
             found INTEGER NOT NULL,
             searched_at TEXT NOT NULL
+        )
+    """)
+
+    # Yopiq kanallarga yuborilgan qo‘shilish so‘rovlari (admin tasdiqlashi kutilayotgan).
+    execute("""
+        CREATE TABLE IF NOT EXISTS join_requests (
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            chat_username TEXT NOT NULL DEFAULT '',
+            requested_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, chat_id)
         )
     """)
 
@@ -494,6 +510,29 @@ def get_channels():
     )
 
 
+def has_join_request(user_id: int, channel) -> bool:
+    """Foydalanuvchi shu kanalga qo‘shilish so‘rovi yuborganmi?
+    Kanal `username` ustunida '@username' yoki raqamli chat ID (-100...)
+    saqlanadi, shuning uchun ikkalasi bo‘yicha ham solishtiriladi."""
+    key = str(channel["username"]).strip().lower()
+    row = execute(
+        "SELECT 1 FROM join_requests "
+        "WHERE user_id=? AND (CAST(chat_id AS TEXT)=? OR chat_username=?)",
+        (user_id, key, key),
+        fetchone=True,
+    )
+    return row is not None
+
+
+def clear_join_request(user_id: int, channel):
+    key = str(channel["username"]).strip().lower()
+    execute(
+        "DELETE FROM join_requests "
+        "WHERE user_id=? AND (CAST(chat_id AS TEXT)=? OR chat_username=?)",
+        (user_id, key, key),
+    )
+
+
 def check_subscription(user_id: int):
     # Premium foydalanuvchilarga majburiy obuna qo‘llanmaydi.
     if premium_active(user_id):
@@ -506,8 +545,19 @@ def check_subscription(user_id: int):
     for channel in channels:
         try:
             member = bot.get_chat_member(channel["username"], user_id)
-            if member.status in ("left", "kicked"):
+
+            if member.status == "kicked":
                 return False
+
+            if member.status == "left":
+                # Yopiq kanal: so‘rov yuborilgan bo‘lsa, admin tasdiqlamagan
+                # bo‘lsa ham obuna bajarilgan hisoblanadi.
+                if has_join_request(user_id, channel):
+                    continue
+                return False
+
+            # Haqiqiy a’zo — eskirgan so‘rov yozuvi kerak emas.
+            clear_join_request(user_id, channel)
         except ApiTelegramException:
             return False
         except Exception:
@@ -598,7 +648,8 @@ def send_subscription_required(chat_id: int):
     bot.send_message(
         chat_id,
         "🔐 <b>Botdan foydalanish uchun kanallarga obuna bo‘ling.</b>\n\n"
-        "Barcha kanallarga kirgach, <b>✅ Obunani tekshirish</b> tugmasini bosing.\n\n"
+        "Barcha kanallarga kirgach, <b>✅ Obunani tekshirish</b> tugmasini bosing.\n"
+        "Yopiq kanallarda qo‘shilish so‘rovini yuborishingiz kifoya.\n\n"
         "👑 Premium foydalanuvchilarga majburiy obuna ko‘rsatilmaydi.",
         reply_markup=subscription_keyboard(),
     )
@@ -705,6 +756,48 @@ def check_subscription_callback(call):
             "Hali barcha kanallarga obuna bo‘lmagansiz.",
             show_alert=True,
         )
+
+
+# =========================================================
+# YOPIQ KANALLAR: QO‘SHILISH SO‘ROVLARI
+# =========================================================
+
+@bot.chat_join_request_handler()
+def join_request_handler(join_request):
+    """Foydalanuvchi so‘rov bilan qo‘shiladigan kanalga so‘rov yuborganda ishlaydi."""
+    try:
+        chat = join_request.chat
+        chat_username = f"@{chat.username}".lower() if chat.username else ""
+
+        execute("""
+            INSERT INTO join_requests(user_id, chat_id, chat_username, requested_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(user_id, chat_id)
+            DO UPDATE SET
+                chat_username=excluded.chat_username,
+                requested_at=excluded.requested_at
+        """, (
+            join_request.from_user.id,
+            chat.id,
+            chat_username,
+            now_text(),
+        ))
+    except Exception:
+        logging.exception("Qo‘shilish so‘rovini saqlashda xato")
+
+
+@bot.chat_member_handler()
+def chat_member_handler(update):
+    """So‘rov tasdiqlanib foydalanuvchi a’zo bo‘lsa, so‘rov yozuvi o‘chiriladi
+    (keyinchalik kanaldan chiqib ketsa, eski so‘rov hisobga olinmasligi uchun)."""
+    try:
+        if update.new_chat_member.status in ("member", "administrator", "creator"):
+            execute(
+                "DELETE FROM join_requests WHERE user_id=? AND chat_id=?",
+                (update.new_chat_member.user.id, update.chat.id),
+            )
+    except Exception:
+        logging.exception("Kanal a’zoligi yangilanishini qayta ishlashda xato")
 
 
 @bot.message_handler(func=lambda message: message.text == "🏠 Asosiy menyu")
@@ -1597,7 +1690,9 @@ def channel_add_callback(call):
     bot.answer_callback_query(call.id)
     bot.send_message(
         call.message.chat.id,
-        "➕ Kanal username yuboring.\n\nMasalan: <code>@kino_kanal</code>",
+        "➕ Kanal username yuboring.\n\nMasalan: <code>@kino_kanal</code>\n\n"
+        "🔒 Yopiq kanal bo‘lsa, username o‘rniga kanalning raqamli ID sini yuboring.\n"
+        "Masalan: <code>-1001234567890</code>",
     )
 
 
@@ -2071,20 +2166,30 @@ def text_state_handler(message):
 
     # ADMIN: kanal username
     if state == "channel_add_username" and is_admin(user_id):
-        username = normalize_channel_username(text)
+        raw_value = text.strip()
+
+        # Yopiq kanalda username bo‘lmaydi — raqamli chat ID yuboriladi.
+        is_private = bool(re.fullmatch(r"-?\d+", raw_value))
+
+        if is_private:
+            # "-100" prefiksisiz yuborilsa, avtomatik qo‘shiladi.
+            username = raw_value if raw_value.startswith("-") else "-100" + raw_value
+            chat_lookup = int(username)
+        else:
+            username = normalize_channel_username(raw_value)
+            chat_lookup = username
 
         try:
-            chat = bot.get_chat(username)
+            chat = bot.get_chat(chat_lookup)
         except Exception:
             bot.send_message(
                 message.chat.id,
                 "❌ Kanal topilmadi.\n"
-                "Botni kanalga admin qiling va username’ni qayta yuboring.",
+                "Botni kanalga admin qiling va username yoki ID ni qayta yuboring.",
             )
             return
 
         title = chat.title or username
-        invite_link = f"https://t.me/{username.lstrip('@')}"
 
         set_state(
             user_id,
@@ -2092,12 +2197,22 @@ def text_state_handler(message):
             f"{username}|{title}",
         )
 
-        bot.send_message(
-            message.chat.id,
-            f"📢 Kanal topildi: <b>{safe(title)}</b>\n\n"
-            "Kanalga kirish havolasini yuboring.\n"
-            f"Ochiq kanal bo‘lsa: <code>{safe(invite_link)}</code>",
-        )
+        if is_private:
+            bot.send_message(
+                message.chat.id,
+                f"🔒 Yopiq kanal topildi: <b>{safe(title)}</b>\n\n"
+                "Kanalga <b>so‘rov bilan qo‘shilish</b> havolasini yuboring.\n"
+                "Masalan: <code>https://t.me/+AbCdEfGhIjKl</code>\n\n"
+                "Havola yaratishda <b>“Request admin approval”</b> yoqilgan bo‘lsin.",
+            )
+        else:
+            invite_link = f"https://t.me/{username.lstrip('@')}"
+            bot.send_message(
+                message.chat.id,
+                f"📢 Kanal topildi: <b>{safe(title)}</b>\n\n"
+                "Kanalga kirish havolasini yuboring.\n"
+                f"Ochiq kanal bo‘lsa: <code>{safe(invite_link)}</code>",
+            )
         return
 
     # ADMIN: kanal linki
@@ -2323,6 +2438,7 @@ def configure_webhook():
                 "callback_query",
                 "my_chat_member",
                 "chat_member",
+                "chat_join_request",
             ],
             drop_pending_updates=True,
         )
